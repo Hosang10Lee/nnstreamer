@@ -85,6 +85,7 @@ enum
 
 static const gchar *gst_tensor_merge_mode_string[] = {
   [GTT_LINEAR] = "linear",
+  [GTT_BLEND] = "blend",
   [GTT_END] = "error",
 };
 
@@ -233,6 +234,11 @@ gst_tensor_merge_init (GstTensorMerge * tensor_merge)
   tensor_merge->loaded = FALSE;
   tensor_merge->current_time = 0;
   tensor_merge->need_set_time = TRUE;
+
+  /* HACK: Assuming 2 tensor input and 5:5 ratio as default,
+   * just in case option data in blend mode is not explicitly given. */
+  tensor_merge->data_blend.ratio[0] = 0.5f;
+  tensor_merge->data_blend.ratio[1] = 0.5f;
 }
 
 /**
@@ -419,6 +425,16 @@ gst_tensor_merge_get_merged_config (GstTensorMerge * tensor_merge,
       ret = TRUE;
     }
       break;
+    case GTT_BLEND:
+    {
+      out_config->info.num_tensors = 1;
+      out_config->info.info[0].type = type;
+      memcpy (&out_config->info.info[0].dimension, &dim, sizeof (tensor_dim));
+      out_config->rate_d = in_config->rate_d;
+      out_config->rate_n = in_config->rate_n;
+      ret = TRUE;
+    }
+      break;
     default:
       ret = FALSE;
   }
@@ -471,28 +487,57 @@ gst_tensor_merge_generate_mem (GstTensorMerge * tensor_merge,
   GstMemory *outMem;
   uint8_t *inptr, *outptr;
   guint num_mem = tensor_merge->tensors_config.info.num_tensors;
-  guint i, j, k, l;
+  guint i, j, k, l, n;
   size_t c, s;
   gsize outSize = 0;
   gsize element_size;
   tensor_dim dim;
   tensor_type type;
+  guint index;
 
   memcpy (&dim, &tensor_merge->tensors_config.info.info[0].dimension,
       sizeof (tensor_dim));
   type = tensor_merge->tensors_config.info.info[0].type;
   element_size = gst_tensor_get_element_size (type);
 
-  for (i = 0; i < num_mem; i++) {
-    mem[i] = gst_tensor_buffer_get_nth_memory (tensors_buf, i);
-    if (!gst_memory_map (mem[i], &mInfo[i], GST_MAP_READ)) {
-      ml_logf ("Cannot map input memory buffers (%d)\n", i);
-      gst_memory_unref (mem[i]);
-      num_mem = i;
-      ret = GST_FLOW_ERROR;
-      goto error_ret;
+  switch (tensor_merge->mode) {
+    case GTT_LINEAR:
+    {
+      for (i = 0; i < num_mem; i++) {
+        mem[i] = gst_buffer_peek_memory (tensors_buf, i);
+        if (!gst_memory_map (mem[i], &mInfo[i], GST_MAP_READ)) {
+          ml_logf ("Cannot map input memory buffers (%d)\n", i);
+          num_mem = i;
+          ret = GST_FLOW_ERROR;
+          goto error_ret;
+        }
+        outSize += mInfo[i].size;
+      }
+      break;
     }
-    outSize += mInfo[i].size;
+    case GTT_BLEND:
+    {
+      for (i = 0; i < num_mem; i++) {
+        mem[i] = gst_buffer_peek_memory (tensors_buf, i);
+        if (!gst_memory_map (mem[i], &mInfo[i], GST_MAP_READ)) {
+          ml_logf ("Cannot map input memory buffers (%d)\n", i);
+          num_mem = i;
+          ret = GST_FLOW_ERROR;
+          goto error_ret;
+        }
+        if (outSize != 0 && outSize != mInfo[i].size) {
+          ml_logf ("Buffer(%d) size(%zu) is different from other size(%zu)\n",
+              i, mInfo[i].size, outSize);
+          num_mem = i;
+          ret = GST_FLOW_ERROR;
+          goto error_ret;
+        }
+        outSize = mInfo[0].size;
+      }
+      break;
+    }
+    default:
+      ret = GST_FLOW_ERROR;
   }
 
   outMem = gst_allocator_alloc (NULL, outSize, NULL);
@@ -582,6 +627,41 @@ gst_tensor_merge_generate_mem (GstTensorMerge * tensor_merge,
         }
         default:
           ret = GST_FLOW_ERROR;
+      }
+      break;
+    }
+    case GTT_BLEND:
+    {
+      GST_DEBUG_OBJECT (tensor_merge, "Blend %d tensors", num_mem);
+      for (i = 0; i < dim[0]; i++) {
+        for (j = 0; j < dim[1]; j++) {
+          for (k = 0; k < dim[2]; k++) {
+            for (l = 0; l < dim[3]; l++) {
+              index = i * dim[1] * dim[2] * dim[3]
+                  + j * dim[2] * dim[3]
+                  + k * dim[3]
+                  + l;
+
+              switch (type) {
+#define sum_ratio_cast(__typename) \
+                    ((__typename*)outptr)[index] = 0; \
+                    for (n = 0; n < num_mem; n++) { \
+                      ((__typename *)outptr)[index] += \
+                          ((__typename *)mInfo[n].data)[index] * \
+                          (__typename)tensor_merge->data_blend.ratio[n]; \
+                    }
+                case _NNS_FLOAT32:
+                  sum_ratio_cast (float);
+                  break;
+                default:
+                  break;
+              }
+              GST_DEBUG_OBJECT (tensor_merge, "index %u:%u:%u:%u value %f %08x",
+                  i, j, k, l, ((float *) outptr)[index],
+                  ((uint32_t *) outptr)[index]);
+            }
+          }
+        }
       }
       break;
     }
@@ -785,6 +865,9 @@ gst_tensor_merge_change_state (GstElement * element, GstStateChange transition)
 static gboolean
 gst_tensor_merge_set_option_data (GstTensorMerge * tensor_merge)
 {
+  gchar **str_ratios;
+  guint num_ratios = 0;
+  guint i, ratio_total = 0;
   if (tensor_merge->mode == GTT_END || tensor_merge->option == NULL)
     return TRUE;
   switch (tensor_merge->mode) {
@@ -798,6 +881,25 @@ gst_tensor_merge_set_option_data (GstTensorMerge * tensor_merge)
         return FALSE;
 
       tensor_merge->data_linear.direction = (tensor_merge_linear_mode) idx;
+
+      tensor_merge->loaded = TRUE;
+    }
+      break;
+    case GTT_BLEND:
+    {
+      str_ratios = g_strsplit_set (tensor_merge->option, ":", -1);
+      num_ratios = g_strv_length (str_ratios);
+
+      for (i = 0; i < num_ratios; i++)
+        ratio_total += atoi (str_ratios[i]);
+
+      for (i = 0; i < num_ratios; i++) {
+        tensor_merge->data_blend.ratio[i] =
+            (float) atoi (str_ratios[i]) / (float) ratio_total;
+        silent_debug (tensor_merge, "Blending ratio for tensor #%u: %f",
+            i, tensor_merge->data_blend.ratio[i]);
+      }
+      g_strfreev (str_ratios);
       tensor_merge->loaded = TRUE;
     }
       break;

@@ -45,6 +45,7 @@ typedef struct _GstTensorMergeClass GstTensorMergeClass;
 typedef enum
 {
   GTT_LINEAR = 0,               /* Dimension Change. "dimchg" */
+  GTT_BLEND,                    /* Blend values by ratio */
   GTT_END,
 } tensor_merge_mode;
 
@@ -66,6 +67,13 @@ typedef struct _tensor_merge_linear {
 } tensor_merge_linear;
 
 /**
+ * @brief Internal data structure for blend mode.
+ */
+typedef struct _tensor_merge_blend {
+  float ratio[LINEAR_END]; /* FIXME: Anything other than LINEAR_END? DIM_MAX?*/
+} tensor_merge_blend;
+
+/**
  * @brief Tensor Merge data structure
  */
 struct _GstTensorMerge
@@ -79,6 +87,7 @@ struct _GstTensorMerge
   tensor_merge_mode mode;
   union{
     tensor_merge_linear data_linear;
+    tensor_merge_blend data_blend;
   };
 
   gboolean loaded;
